@@ -1,10 +1,10 @@
-# CAP-ACL-2026 (Anonymous Review Artifact)
+# CAP-ACL-2026
 
-This repository contains code, prompts (embedded in code + selected prompt files), and precomputed outputs supporting the paper:
+Code and artifacts for the BioNLP 2026 paper:
 
 **CAP: A Source-Grounded Proposition Scaffold for Faithful Clinical Dialogue-to-Note Generation**
 
-The artifact is organized so that reviewers can:
+This repository is organized so that readers can:
 - Inspect the end-to-end pipeline implementation (`X -> C -> E -> Y`).
 - Inspect prompt-based reimplementations of baselines (Direct, Cluster2Sent-inspired, MEDSUM-ENT-inspired).
 - Reproduce paper tables/figures from the included precomputed outputs without rerunning LLM inference.
@@ -35,6 +35,12 @@ We recommend using explicit `--api-base-url` / `--judge-api-base-url` arguments 
 Main entrypoints:
 - `code/run_problem_state_tracking_experiments.py` (CAP extraction)
 - `code/run_template_rendering_experiments.py` (note rendering + evaluation)
+- `tools/run_deployment_cost_subset_e2e.py` (deployment-path latency/token analysis on subset: `X->Y`, `X->C->Y`, `X->C->E->Y`)
+
+Example (deployment-path cost analysis on a 30-case subset):
+```bash
+python3 tools/run_deployment_cost_subset_e2e.py --subset-size 30 --seed 57 --force-regenerate
+```
 
 ## Prompts
 
@@ -47,9 +53,9 @@ To regenerate these snapshots from `code/`:
 python3 tools/export_prompts.py
 ```
 
-## Notes On Anonymity
+## Notes
 
-This artifact intentionally excludes:
+This repository intentionally excludes:
 - `.env` files / API keys
 - personal identifiers
 - legacy backups and experimental scratch files

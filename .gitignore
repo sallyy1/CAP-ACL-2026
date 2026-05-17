@@ -14,3 +14,9 @@ __pycache__/
 .venv/
 venv/
 
+# Local runtime outputs and convenience symlinks
+outputs
+code/outputs/
+results/subset_backbone_sensitivity/
+results/backbone_gemma3_subset30_sectioned_direct_cap_capevent/
+results/latency_cost_sectioned_direct_cap_capevent.csv

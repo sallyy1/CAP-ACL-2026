@@ -1828,12 +1828,36 @@ class OpenAICompatClient:
                 base_url=self.base_url,
                 timeout=timeout,
             )
+        self.usage_totals = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+
+    def _extract_usage(self, response_obj: Any) -> Dict[str, int]:
+        usage = getattr(response_obj, "usage", None)
+        if usage is not None:
+            p = int(getattr(usage, "prompt_tokens", 0) or 0)
+            c = int(getattr(usage, "completion_tokens", 0) or 0)
+            t = int(getattr(usage, "total_tokens", 0) or (p + c))
+            return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": t}
+        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    def _accumulate_usage(self, usage: Dict[str, int]) -> None:
+        self.usage_totals["prompt_tokens"] += int(usage.get("prompt_tokens", 0) or 0)
+        self.usage_totals["completion_tokens"] += int(usage.get("completion_tokens", 0) or 0)
+        self.usage_totals["total_tokens"] += int(usage.get("total_tokens", 0) or 0)
+
+    def get_usage_totals(self) -> Dict[str, int]:
+        return dict(self.usage_totals)
 
     def chat_completion(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         if self.sdk_client is not None:
             response = self.sdk_client.chat.completions.create(**payload)
             content = response.choices[0].message.content if response.choices else ""
-            return {"choices": [{"message": {"content": content}}]}
+            usage = self._extract_usage(response)
+            self._accumulate_usage(usage)
+            return {"choices": [{"message": {"content": content}}], "usage": usage}
 
         req = urllib_request.Request(
             url=f"{self.base_url}/chat/completions",
@@ -1848,7 +1872,16 @@ class OpenAICompatClient:
         )
         try:
             with urllib_request.urlopen(req, timeout=self.timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                raw = json.loads(resp.read().decode("utf-8"))
+                usage_obj = raw.get("usage") or {}
+                usage = {
+                    "prompt_tokens": int(usage_obj.get("prompt_tokens", 0) or 0),
+                    "completion_tokens": int(usage_obj.get("completion_tokens", 0) or 0),
+                    "total_tokens": int(usage_obj.get("total_tokens", 0) or 0),
+                }
+                self._accumulate_usage(usage)
+                raw["usage"] = usage
+                return raw
         except urllib_error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"HTTP {exc.code} from {req.full_url}: {detail}") from exc
@@ -7195,6 +7228,14 @@ def metrics_have_evaluation(metrics: Optional[Dict[str, Any]]) -> bool:
     )
 
 
+def usage_delta(after: Dict[str, int], before: Dict[str, int]) -> Dict[str, int]:
+    return {
+        "prompt_tokens": int(after.get("prompt_tokens", 0) or 0) - int(before.get("prompt_tokens", 0) or 0),
+        "completion_tokens": int(after.get("completion_tokens", 0) or 0) - int(before.get("completion_tokens", 0) or 0),
+        "total_tokens": int(after.get("total_tokens", 0) or 0) - int(before.get("total_tokens", 0) or 0),
+    }
+
+
 CASE_METRIC_FIELDNAMES = [
     "case_id",
     "method",
@@ -7281,6 +7322,12 @@ CASE_METRIC_FIELDNAMES = [
     "summary_runtime_seconds",
     "summary_cap_runtime_seconds",
     "event_plan_runtime_seconds",
+    "event_plan_prompt_tokens",
+    "event_plan_completion_tokens",
+    "event_plan_total_tokens",
+    "llm_prompt_tokens",
+    "llm_completion_tokens",
+    "llm_total_tokens",
 ]
 
 AGGREGATE_METRIC_NAMES = [
@@ -7333,6 +7380,15 @@ AGGREGATE_METRIC_NAMES = [
     "summary_cap_count",
     "unsupported_summary_cap_count",
     "missing_source_cap_count",
+    "summary_runtime_seconds",
+    "summary_cap_runtime_seconds",
+    "event_plan_runtime_seconds",
+    "event_plan_prompt_tokens",
+    "event_plan_completion_tokens",
+    "event_plan_total_tokens",
+    "llm_prompt_tokens",
+    "llm_completion_tokens",
+    "llm_total_tokens",
 ]
 
 AGGREGATE_FIELDNAMES = [
@@ -7388,6 +7444,15 @@ AGGREGATE_FIELDNAMES = [
     "summary_cap_count",
     "unsupported_summary_cap_count",
     "missing_source_cap_count",
+    "summary_runtime_seconds",
+    "summary_cap_runtime_seconds",
+    "event_plan_runtime_seconds",
+    "event_plan_prompt_tokens",
+    "event_plan_completion_tokens",
+    "event_plan_total_tokens",
+    "llm_prompt_tokens",
+    "llm_completion_tokens",
+    "llm_total_tokens",
 ]
 
 
@@ -7439,6 +7504,7 @@ def process_method_template_task(
     source_cap: Dict[str, Any],
     event_plan_cache: Optional[Dict[str, Any]],
     event_plan_runtime: Optional[float],
+    event_plan_usage: Optional[Dict[str, int]],
     ref_gpt_items: Optional[Dict[str, List[str]]],
     ref_nair_concepts: Optional[Dict[str, Any]],
     args: argparse.Namespace,
@@ -7457,6 +7523,9 @@ def process_method_template_task(
     checklist_dir: Path,
     case_dir: Path,
 ) -> Optional[Dict[str, Any]]:
+    generation_usage_before = client.get_usage_totals()
+    judge_usage_before = judge_client.get_usage_totals()
+
     stem = method_output_stem(case_id, method_key, template_key)
     summary_path = summary_dir / f"{stem}.txt"
     summary_cap_path = summary_cap_dir / f"{stem}.json"
@@ -7607,6 +7676,11 @@ def process_method_template_task(
         print(f"[INFO] {case_id} {method_key}/{template_key}: summary done in {summary_runtime}s", flush=True)
 
     if args.generation_only:
+        generation_usage_after = client.get_usage_totals()
+        usage_gen = usage_delta(generation_usage_after, generation_usage_before)
+        event_usage = event_plan_usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        if method_key != "cap_event":
+            event_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         metrics = {
             "case_id": case_id,
             "method": method_key,
@@ -7623,6 +7697,12 @@ def process_method_template_task(
             "summary_runtime_seconds": summary_runtime,
             "summary_cap_runtime_seconds": None,
             "event_plan_runtime_seconds": event_plan_runtime if method_uses_event_plan(method_key) else None,
+            "event_plan_prompt_tokens": event_usage["prompt_tokens"],
+            "event_plan_completion_tokens": event_usage["completion_tokens"],
+            "event_plan_total_tokens": event_usage["total_tokens"],
+            "llm_prompt_tokens": usage_gen["prompt_tokens"] + event_usage["prompt_tokens"],
+            "llm_completion_tokens": usage_gen["completion_tokens"] + event_usage["completion_tokens"],
+            "llm_total_tokens": usage_gen["total_tokens"] + event_usage["total_tokens"],
             "rouge_l_f1_vs_reference": round(rouge_l_f1(summary_text, reference_summary), 4) if reference_summary else None,
             "token_f1_vs_reference": round(token_f1(summary_text, reference_summary), 4) if reference_summary else None,
             "gptf1_macro_f1": None,
@@ -8015,6 +8095,19 @@ def process_method_template_task(
         "llm_checklist_meaningful_omission_yes": checklist_metrics.get("llm_checklist_meaningful_omission_yes"),
         "llm_checklist_concerning_hallucination_yes": checklist_metrics.get("llm_checklist_concerning_hallucination_yes"),
     }
+    generation_usage_after = client.get_usage_totals()
+    judge_usage_after = judge_client.get_usage_totals()
+    usage_gen = usage_delta(generation_usage_after, generation_usage_before)
+    usage_judge = usage_delta(judge_usage_after, judge_usage_before)
+    event_usage = event_plan_usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    if method_key != "cap_event":
+        event_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    metrics["event_plan_prompt_tokens"] = event_usage["prompt_tokens"]
+    metrics["event_plan_completion_tokens"] = event_usage["completion_tokens"]
+    metrics["event_plan_total_tokens"] = event_usage["total_tokens"]
+    metrics["llm_prompt_tokens"] = usage_gen["prompt_tokens"] + usage_judge["prompt_tokens"] + event_usage["prompt_tokens"]
+    metrics["llm_completion_tokens"] = usage_gen["completion_tokens"] + usage_judge["completion_tokens"] + event_usage["completion_tokens"]
+    metrics["llm_total_tokens"] = usage_gen["total_tokens"] + usage_judge["total_tokens"] + event_usage["total_tokens"]
     metrics.update(gpt_f1_metrics)
     metrics.update(nair_metrics)
     metrics.update({k: v for k, v in semantic_cap_metrics_dict.items() if k not in metrics})
@@ -8160,6 +8253,7 @@ def process_case(
 
     event_plan_cache: Optional[Dict[str, Any]] = None
     event_plan_runtime: Optional[float] = None
+    event_plan_usage: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     if any(method in methods for method in ("cap_event", "cap_event_only")):
         event_plan_path = event_plan_dir / f"{case_id}_cap_event_plan.json"
         if event_plan_path.exists():
@@ -8173,6 +8267,7 @@ def process_case(
                     event_plan_cache = convert_problem_clusters_to_event_plan(problem_cluster_cache, cap_obj=source_cap)
                     event_plan_runtime = 0.0
                 else:
+                    usage_before = client.get_usage_totals()
                     t0 = time.perf_counter()
                     event_plan_cache = build_event_plan(
                         client,
@@ -8182,10 +8277,13 @@ def process_case(
                         temperature=args.temperature,
                     )
                     event_plan_runtime = round(time.perf_counter() - t0, 3)
+                    usage_after = client.get_usage_totals()
+                    event_plan_usage = usage_delta(usage_after, usage_before)
                     event_plan_cache["runtime_seconds"] = event_plan_runtime
                 write_json(event_plan_path, event_plan_cache)
             elif not event_plan_cache.get("events") and not args.evaluation_only:
                 print(f"[INFO] {case_id}: cached CAP event plan was empty; rebuilding", flush=True)
+                usage_before = client.get_usage_totals()
                 t0 = time.perf_counter()
                 event_plan_cache = build_event_plan(
                     client,
@@ -8195,6 +8293,8 @@ def process_case(
                     temperature=args.temperature,
                 )
                 event_plan_runtime = round(time.perf_counter() - t0, 3)
+                usage_after = client.get_usage_totals()
+                event_plan_usage = usage_delta(usage_after, usage_before)
                 event_plan_cache["runtime_seconds"] = event_plan_runtime
                 write_json(event_plan_path, event_plan_cache)
                 print(f"[INFO] {case_id}: CAP event plan done in {event_plan_runtime}s", flush=True)
@@ -8212,6 +8312,7 @@ def process_case(
             )
         elif not args.evaluation_only:
             print(f"[INFO] {case_id}: building CAP event plan", flush=True)
+            usage_before = client.get_usage_totals()
             t0 = time.perf_counter()
             event_plan_cache = build_event_plan(
                 client,
@@ -8221,6 +8322,8 @@ def process_case(
                 temperature=args.temperature,
             )
             event_plan_runtime = round(time.perf_counter() - t0, 3)
+            usage_after = client.get_usage_totals()
+            event_plan_usage = usage_delta(usage_after, usage_before)
             event_plan_cache["runtime_seconds"] = event_plan_runtime
             write_json(event_plan_path, event_plan_cache)
             print(f"[INFO] {case_id}: CAP event plan done in {event_plan_runtime}s", flush=True)
@@ -8283,6 +8386,7 @@ def process_case(
                     source_cap=source_cap,
                     event_plan_cache=event_plan_cache,
                     event_plan_runtime=event_plan_runtime,
+                    event_plan_usage=event_plan_usage,
                     ref_gpt_items=ref_gpt_items,
                     ref_nair_concepts=ref_nair_concepts,
                     args=args,
@@ -8325,6 +8429,7 @@ def process_case(
                     source_cap=source_cap,
                     event_plan_cache=event_plan_cache,
                     event_plan_runtime=event_plan_runtime,
+                    event_plan_usage=event_plan_usage,
                     ref_gpt_items=ref_gpt_items,
                     ref_nair_concepts=ref_nair_concepts,
                     args=args,
@@ -8380,9 +8485,36 @@ def main() -> None:
     judge_api_key = args.judge_api_key or (os.getenv("OPENAI_API_KEY", "") if judge_api_base_url == "https://api.openai.com/v1" else api_key)
     judge_client = OpenAICompatClient(base_url=judge_api_base_url, api_key=judge_api_key, timeout=args.request_timeout)
 
-    method_a_rows = load_method_csv(args.method_a_csv)
-    method_b_rows = load_method_csv(args.method_b_csv)
-    method_c_rows = load_method_csv(args.method_c_csv)
+    need_method_a = "medsum_ent" in methods
+    need_method_b = "cluster2sent" in methods
+    need_method_c = (
+        any(method in methods for method in ("cap", "cap_only", "cap_event", "cap_event_only"))
+        and args.problem_state_dir is None
+    )
+
+    method_a_rows: Dict[str, Dict[str, str]] = {}
+    method_b_rows: Dict[str, Dict[str, str]] = {}
+    method_c_rows: Dict[str, Dict[str, str]] = {}
+
+    if need_method_a:
+        if not args.method_a_csv.exists():
+            raise SystemExit(
+                f"Missing --method-a-csv file required for method 'medsum_ent': {args.method_a_csv}"
+            )
+        method_a_rows = load_method_csv(args.method_a_csv)
+    if need_method_b:
+        if not args.method_b_csv.exists():
+            raise SystemExit(
+                f"Missing --method-b-csv file required for method 'cluster2sent': {args.method_b_csv}"
+            )
+        method_b_rows = load_method_csv(args.method_b_csv)
+    if need_method_c:
+        if not args.method_c_csv.exists():
+            raise SystemExit(
+                "Missing --method-c-csv file required for CAP methods when --problem-state-dir is not provided: "
+                f"{args.method_c_csv}"
+            )
+        method_c_rows = load_method_csv(args.method_c_csv)
     cases = load_cases(args.cases_path, args.limit, args.case_ids)
     transcript_cap_input_dir = args.problem_state_dir / "transcript_caps" if args.problem_state_dir else None
     problem_cluster_input_dir = args.problem_state_dir / "problem_clusters" if args.problem_state_dir else None

@@ -545,6 +545,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument(
+        "--deployment-cost-only",
+        action="store_true",
+        help=(
+            "Skip reference-note CAP extraction/evaluation and run transcript-side CAP extraction only. "
+            "Use this for deployment-path latency/token accounting (X->C)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -2601,6 +2609,9 @@ CASE_FIELDNAMES = [
     "state_f1",
     "transcript_cap_runtime_seconds",
     "reference_cap_runtime_seconds",
+    "transcript_cap_prompt_tokens",
+    "transcript_cap_completion_tokens",
+    "transcript_cap_total_tokens",
 ]
 
 AGG_METRICS = [
@@ -2673,7 +2684,9 @@ def main() -> None:
     for idx, (case_id, case) in enumerate(cases.items(), start=1):
         transcript = base.safe_text(case.get("transcript"))
         reference_summary = base.safe_text(case.get("summary_gt_note"))
-        if not transcript or not reference_summary:
+        if not transcript:
+            continue
+        if not args.deployment_cost_only and not reference_summary:
             continue
         print(f"[INFO] ({idx}/{len(cases)}) Processing {case_id}", flush=True)
 
@@ -2683,25 +2696,32 @@ def main() -> None:
         report_path = report_dir / f"{case_id}.txt"
 
         turns = parse_transcript_turns(transcript)
-        note_units = split_note_sentences(reference_summary)
+        note_units = split_note_sentences(reference_summary) if reference_summary else []
 
-        reuse_existing = args.skip_existing and transcript_caps_path.exists() and reference_caps_path.exists() and cluster_path.exists()
+        if args.deployment_cost_only:
+            reuse_existing = args.skip_existing and transcript_caps_path.exists() and cluster_path.exists()
+        else:
+            reuse_existing = args.skip_existing and transcript_caps_path.exists() and reference_caps_path.exists() and cluster_path.exists()
         if reuse_existing:
             transcript_cap_obj = base.read_json(transcript_caps_path)
-            reference_cap_obj = base.read_json(reference_caps_path)
+            reference_cap_obj = base.read_json(reference_caps_path) if (not args.deployment_cost_only and reference_caps_path.exists()) else None
             cluster_obj = base.read_json(cluster_path)
             if transcript_cap_obj.get("caps"):
                 transcript_cap_obj = assign_event_cluster_ids(transcript_cap_obj, cluster_obj)
                 base.write_json(transcript_caps_path, transcript_cap_obj)
                 if not report_path.exists():
                     report_path.write_text(render_problem_state_report(case_id, cluster_obj), encoding="utf-8")
-                print(f"[INFO] {case_id}: reuse existing transcript/reference CAPs", flush=True)
+                if args.deployment_cost_only:
+                    print(f"[INFO] {case_id}: reuse existing transcript CAPs (deployment-cost-only)", flush=True)
+                else:
+                    print(f"[INFO] {case_id}: reuse existing transcript/reference CAPs", flush=True)
             else:
                 print(f"[INFO] {case_id}: existing transcript CAPs are empty; re-running extraction", flush=True)
                 reuse_existing = False
         if not reuse_existing:
             try:
                 t0 = time.perf_counter()
+                usage_before = extractor_client.get_usage_totals()
                 print(f"[INFO] {case_id}: extracting transcript CAPs", flush=True)
                 if args.cap_extraction_mode == "single_call":
                     transcript_cap_obj = extract_transcript_caps_single_call(
@@ -2720,6 +2740,11 @@ def main() -> None:
                         turns=turns,
                     )
                 transcript_cap_obj["runtime_seconds"] = round(time.perf_counter() - t0, 3)
+                usage_after = extractor_client.get_usage_totals()
+                transcript_usage = base.usage_delta(usage_after, usage_before)
+                transcript_cap_obj["prompt_tokens"] = int(transcript_usage.get("prompt_tokens", 0))
+                transcript_cap_obj["completion_tokens"] = int(transcript_usage.get("completion_tokens", 0))
+                transcript_cap_obj["total_tokens"] = int(transcript_usage.get("total_tokens", 0))
                 print(
                     f"[INFO] {case_id}: transcript CAPs={len(transcript_cap_obj.get('caps', []))} "
                     f"chunks={transcript_cap_obj.get('chunk_count', 1)} "
@@ -2729,33 +2754,35 @@ def main() -> None:
                     flush=True,
                 )
 
-                t0 = time.perf_counter()
-                print(f"[INFO] {case_id}: extracting reference CAPs", flush=True)
-                if args.cap_extraction_mode == "single_call":
-                    reference_cap_obj = extract_reference_caps_single_call(
-                        extractor_client,
-                        model=extractor_model,
-                        max_tokens=args.max_extraction_tokens,
-                        temperature=args.temperature,
-                        note_units=note_units,
+                reference_cap_obj = None
+                if not args.deployment_cost_only:
+                    t0 = time.perf_counter()
+                    print(f"[INFO] {case_id}: extracting reference CAPs", flush=True)
+                    if args.cap_extraction_mode == "single_call":
+                        reference_cap_obj = extract_reference_caps_single_call(
+                            extractor_client,
+                            model=extractor_model,
+                            max_tokens=args.max_extraction_tokens,
+                            temperature=args.temperature,
+                            note_units=note_units,
+                        )
+                    else:
+                        reference_cap_obj = extract_reference_caps(
+                            extractor_client,
+                            model=extractor_model,
+                            max_tokens=args.max_extraction_tokens,
+                            temperature=args.temperature,
+                            note_units=note_units,
+                        )
+                    reference_cap_obj["runtime_seconds"] = round(time.perf_counter() - t0, 3)
+                    print(
+                        f"[INFO] {case_id}: reference CAPs={len(reference_cap_obj.get('caps', []))} "
+                        f"chunks={reference_cap_obj.get('chunk_count', 1)} "
+                        f"mode={reference_cap_obj.get('extraction_mode', args.cap_extraction_mode)} "
+                        f"runtime={reference_cap_obj['runtime_seconds']}s",
+                        flush=True,
                     )
-                else:
-                    reference_cap_obj = extract_reference_caps(
-                        extractor_client,
-                        model=extractor_model,
-                        max_tokens=args.max_extraction_tokens,
-                        temperature=args.temperature,
-                        note_units=note_units,
-                    )
-                reference_cap_obj["runtime_seconds"] = round(time.perf_counter() - t0, 3)
-                print(
-                    f"[INFO] {case_id}: reference CAPs={len(reference_cap_obj.get('caps', []))} "
-                    f"chunks={reference_cap_obj.get('chunk_count', 1)} "
-                    f"mode={reference_cap_obj.get('extraction_mode', args.cap_extraction_mode)} "
-                    f"runtime={reference_cap_obj['runtime_seconds']}s",
-                    flush=True,
-                )
-                base.write_json(reference_caps_path, reference_cap_obj)
+                    base.write_json(reference_caps_path, reference_cap_obj)
 
                 cluster_obj = cluster_problem_states(transcript_cap_obj)
                 transcript_cap_obj = assign_event_cluster_ids(transcript_cap_obj, cluster_obj)
@@ -2771,30 +2798,43 @@ def main() -> None:
                 base.write_json(report_dir / f"{case_id}_error.json", error_payload)
                 continue
 
-        ref_cluster_obj = cluster_problem_states(reference_cap_obj)
-        concept_p, concept_r, concept_f1 = set_prf(
-            cluster_signature_set(cluster_obj, include_state=False),
-            cluster_signature_set(ref_cluster_obj, include_state=False),
-        )
-        state_p, state_r, state_f1 = set_prf(
-            cluster_signature_set(cluster_obj, include_state=True),
-            cluster_signature_set(ref_cluster_obj, include_state=True),
-        )
+        if args.deployment_cost_only:
+            concept_p = concept_r = concept_f1 = None
+            state_p = state_r = state_f1 = None
+            reference_cap_count = None
+            reference_cap_runtime = None
+            reference_cluster_count = None
+        else:
+            ref_cluster_obj = cluster_problem_states(reference_cap_obj)
+            concept_p, concept_r, concept_f1 = set_prf(
+                cluster_signature_set(cluster_obj, include_state=False),
+                cluster_signature_set(ref_cluster_obj, include_state=False),
+            )
+            state_p, state_r, state_f1 = set_prf(
+                cluster_signature_set(cluster_obj, include_state=True),
+                cluster_signature_set(ref_cluster_obj, include_state=True),
+            )
+            reference_cap_count = len(reference_cap_obj.get("caps", []))
+            reference_cap_runtime = reference_cap_obj.get("runtime_seconds")
+            reference_cluster_count = len(ref_cluster_obj.get("clusters", []))
 
         row = {
             "case_id": case_id,
             "transcript_cap_count": len(transcript_cap_obj.get("caps", [])),
-            "reference_cap_count": len(reference_cap_obj.get("caps", [])),
+            "reference_cap_count": reference_cap_count,
             "cluster_count": len(cluster_obj.get("clusters", [])),
-            "reference_cluster_count": len(ref_cluster_obj.get("clusters", [])),
-            "concept_precision": round(concept_p, 4),
-            "concept_recall": round(concept_r, 4),
-            "concept_f1": round(concept_f1, 4),
-            "state_precision": round(state_p, 4),
-            "state_recall": round(state_r, 4),
-            "state_f1": round(state_f1, 4),
+            "reference_cluster_count": reference_cluster_count,
+            "concept_precision": round(concept_p, 4) if concept_p is not None else None,
+            "concept_recall": round(concept_r, 4) if concept_r is not None else None,
+            "concept_f1": round(concept_f1, 4) if concept_f1 is not None else None,
+            "state_precision": round(state_p, 4) if state_p is not None else None,
+            "state_recall": round(state_r, 4) if state_r is not None else None,
+            "state_f1": round(state_f1, 4) if state_f1 is not None else None,
             "transcript_cap_runtime_seconds": transcript_cap_obj.get("runtime_seconds"),
-            "reference_cap_runtime_seconds": reference_cap_obj.get("runtime_seconds"),
+            "reference_cap_runtime_seconds": reference_cap_runtime,
+            "transcript_cap_prompt_tokens": int(transcript_cap_obj.get("prompt_tokens", 0) or 0),
+            "transcript_cap_completion_tokens": int(transcript_cap_obj.get("completion_tokens", 0) or 0),
+            "transcript_cap_total_tokens": int(transcript_cap_obj.get("total_tokens", 0) or 0),
         }
         case_rows.append(row)
         flush_progress(output_dir, case_rows)
