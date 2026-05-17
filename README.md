@@ -4,6 +4,8 @@ Code and artifacts for the BioNLP 2026 paper:
 
 **CAP: A Source-Grounded Proposition Scaffold for Faithful Clinical Dialogue-to-Note Generation**
 
+This work was conducted at AITRICS.
+
 This repository is organized so that readers can:
 - Inspect the end-to-end pipeline implementation (`X -> C -> E -> Y`).
 - Inspect prompt-based reimplementations of baselines (Direct, Cluster2Sent-inspired, MEDSUM-ENT-inspired).
